@@ -1,11 +1,201 @@
 from fastapi import FastAPI, HTTPException, Depends
+from typing import Literal
+import firebase_admin
+from firebase_admin import credentials, db
+
+app = FastAPI()
+
+# 🔹 Initialize Firebase
+cred = credentials.Certificate("firebase-adminsdk.json")  # Ensure this file is in your project folder
+firebase_admin.initialize_app(cred, {
+    'databaseURL': 'https://budgetdb-7d811-default-rtdb.firebaseio.com/'  # Replace with your actual URL
+})
+
+# 🔹 Define User Roles
+USER_ROLES = {
+    "admin": {"can_edit": True, "can_view": True},
+    "viewer": {"can_edit": False, "can_view": True}
+}
+
+
+def get_user_role(role: Literal["admin", "viewer"]):
+    """Checks if the user role is valid and returns role permissions."""
+    if role not in USER_ROLES:
+        raise HTTPException(status_code=403, detail="Invalid user role")
+    return USER_ROLES[role]
+
+
+@app.get("/")
+def home():
+    return {"message": "Welcome to the Budget Dashboard API"}
+
+
+# 1️⃣ **Fetch total budget summary (Admin & Viewer)**
+@app.get("/budget/summary")
+def get_budget_summary(user_role: dict = Depends(lambda: get_user_role("viewer"))):
+    ref = db.reference("/budget_transactions")
+    transactions = ref.get()
+
+    if not transactions:
+        raise HTTPException(status_code=404, detail="No budget data available")
+
+    summary = {}
+
+    # 🔹 Iterate over the list instead of using `.items()`
+    for record in transactions:
+        if not isinstance(record, dict):
+            continue  # Ignore invalid entries
+
+        subsidiary = record.get("Subsidiary", "Unknown")
+        sector = record.get("Sector", "Unknown")
+
+        if (subsidiary, sector) not in summary:
+            summary[(subsidiary, sector)] = {"total_allocated": 0, "total_spent": 0, "total_remaining": 0}
+
+        summary[(subsidiary, sector)]["total_allocated"] += record.get("Allocated_Budget", 0)
+        summary[(subsidiary, sector)]["total_spent"] += record.get("Spent_Amount", 0)
+        summary[(subsidiary, sector)]["total_remaining"] += record.get("Remaining_Budget", 0)
+
+    return [{"Subsidiary": sub, "Sector": sec, **vals} for (sub, sec), vals in summary.items()]
+
+
+# 2️⃣ **Fetch budget by subsidiary (Admin & Viewer)**
+@app.get("/budget/subsidiary/{subsidiary}")
+def get_budget_by_subsidiary(subsidiary: str, user_role: dict = Depends(lambda: get_user_role("viewer"))):
+    ref = db.reference("/budget_transactions")
+    transactions = ref.get()
+
+    if not transactions:
+        raise HTTPException(status_code=404, detail="No budget data available")
+
+    summary = {}
+
+    for record in transactions:
+        if isinstance(record, dict) and record.get("Subsidiary") == subsidiary:
+            sector = record.get("Sector", "Unknown")
+            if sector not in summary:
+                summary[sector] = {"total_allocated": 0, "total_spent": 0, "total_remaining": 0}
+
+            summary[sector]["total_allocated"] += record.get("Allocated_Budget", 0)
+            summary[sector]["total_spent"] += record.get("Spent_Amount", 0)
+            summary[sector]["total_remaining"] += record.get("Remaining_Budget", 0)
+
+    if not summary:
+        raise HTTPException(status_code=404, detail=f"No budget data found for subsidiary: {subsidiary}")
+
+    return [{"Sector": sec, **vals} for sec, vals in summary.items()]
+
+
+# 3️⃣ **Fetch budget by sector (Admin & Viewer)**
+@app.get("/budget/sector/{sector}")
+def get_budget_by_sector(sector: str, user_role: dict = Depends(lambda: get_user_role("viewer"))):
+    ref = db.reference("/budget_transactions")
+    transactions = ref.get()
+
+    if not transactions:
+        raise HTTPException(status_code=404, detail="No budget data available")
+
+    summary = {}
+
+    for record in transactions:
+        if isinstance(record, dict) and record.get("Sector") == sector:
+            subsidiary = record.get("Subsidiary", "Unknown")
+            if subsidiary not in summary:
+                summary[subsidiary] = {"total_allocated": 0, "total_spent": 0, "total_remaining": 0}
+
+            summary[subsidiary]["total_allocated"] += record.get("Allocated_Budget", 0)
+            summary[subsidiary]["total_spent"] += record.get("Spent_Amount", 0)
+            summary[subsidiary]["total_remaining"] += record.get("Remaining_Budget", 0)
+
+    if not summary:
+        raise HTTPException(status_code=404, detail=f"No budget data found for sector: {sector}")
+
+    return [{"Subsidiary": sub, **vals} for sub, vals in summary.items()]
+
+
+# 4️⃣ **Fetch all transactions (Admin & Viewer)**
+@app.get("/transactions")
+def get_all_transactions(user_role: dict = Depends(lambda: get_user_role("viewer"))):
+    ref = db.reference("/budget_transactions")
+    transactions = ref.get()
+
+    if not transactions:
+        raise HTTPException(status_code=404, detail="No transactions found")
+
+    return transactions  # No need to use `.items()`, return list directly
+
+
+# 5️⃣ **Add a new transaction (Admin Only)**
+@app.post("/transactions/add")
+def add_transaction(
+        Transaction_ID: str,
+        Date: str,
+        Subsidiary: str,
+        Sector: str,
+        User_ID: str,
+        Allocated_Budget: float,
+        Spent_Amount: float,
+        Remaining_Budget: float,
+        Revenue_Generated: float,
+        Transaction_Type: str,
+        user_role: dict = Depends(lambda: get_user_role("admin"))
+):
+    if not user_role["can_edit"]:
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    ref = db.reference("/budget_transactions")
+    transactions = ref.get() or []  # Get existing transactions or an empty list
+    new_transaction = {
+        "Transaction_ID": Transaction_ID,
+        "Date": Date,
+        "Subsidiary": Subsidiary,
+        "Sector": Sector,
+        "User_ID": User_ID,
+        "Allocated_Budget": Allocated_Budget,
+        "Spent_Amount": Spent_Amount,
+        "Remaining_Budget": Remaining_Budget,
+        "Revenue_Generated": Revenue_Generated,
+        "Transaction_Type": Transaction_Type
+    }
+
+    transactions.append(new_transaction)
+    ref.set(transactions)  # Save updated list back to Firebase
+
+    return {"message": "Transaction added successfully"}
+
+
+# 6️⃣ **Delete a transaction (Admin Only)**
+@app.delete("/transactions/delete/{transaction_id}")
+def delete_transaction(transaction_id: str, user_role: dict = Depends(lambda: get_user_role("admin"))):
+    if not user_role["can_edit"]:
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    ref = db.reference("/budget_transactions")
+    transactions = ref.get()
+
+    if not transactions:
+        raise HTTPException(status_code=404, detail="No transactions found")
+
+    # Filter out the transaction with the given ID
+    updated_transactions = [t for t in transactions if t.get("Transaction_ID") != transaction_id]
+
+    if len(updated_transactions) == len(transactions):
+        raise HTTPException(status_code=404, detail=f"Transaction {transaction_id} not found")
+
+    ref.set(updated_transactions)  # Save updated list to Firebase
+
+    return {"message": f"Transaction {transaction_id} deleted successfully"}
+
+
+'''from fastapi import FastAPI, HTTPException, Depends
 from sqlalchemy import create_engine, text
 from typing import Literal
 
 app = FastAPI()
 
 # Database Connection
-DATABASE_URL = "mysql+pymysql://root:pranjal@localhost:3306/budget_db"
+#DATABASE_URL = "mysql+pymysql://root:pranjal@localhost:3306/budget_db"
+DATABASE_URL = "mysql+pymysql://if0_38623850:SDci3xl8GCsWt@sql210.infinityfree.com/if0_38623850_budget_db"
 engine = create_engine(DATABASE_URL)
 
 # Mock User Roles (Replace with actual authentication in a real system)
@@ -195,3 +385,4 @@ def delete_transaction(transaction_id: str, user_role: dict = Depends(lambda: ge
         raise HTTPException(status_code=404, detail=f"Transaction {transaction_id} not found")
 
     return {"message": f"Transaction {transaction_id} deleted successfully"}
+'''
